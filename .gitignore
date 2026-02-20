@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 一時ファイル・ログ
+downloads/
+download_history.txt
+*.png

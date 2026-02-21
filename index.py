@@ -9,13 +9,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
+from config import LOGIN_URL, DASHBOARD_URL, USER_NAME, PASSWORD, DOWNLOAD_DIR
 
-# --- 設定項目 ---
-LOGIN_URL = "https://streamrecorder.io/login"
-DASHBOARD_URL = "https://streamrecorder.io/userdashboard"
-USER_NAME = "USER_ID"
-PASSWORD = "PASSWORD"  # ここを実際のパスワードに書き換えてください
-DOWNLOAD_DIR = os.path.join(os.getcwd(), "downloads")
 HISTORY_FILE = "download_history.txt"
 
 if not os.path.exists(DOWNLOAD_DIR):

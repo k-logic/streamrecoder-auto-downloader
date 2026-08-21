@@ -17,47 +17,64 @@ from config import LOGIN_URL, DASHBOARD_URL, USER_NAME, PASSWORD, DOWNLOAD_DIR
 # config.py に無ければデフォルトを使う（後方互換）
 NAS_MOUNT_DIR = getattr(config, "NAS_MOUNT_DIR", "/mnt/nas_video")
 PREFERRED_QUALITY = getattr(config, "PREFERRED_QUALITY", "720p")
+# ダッシュボード表示中カードのうち、新しい方から何件を対象にするか
+# （同日複数配信や取りこぼしを拾うため複数本を確認。ダッシュボードは最大16件表示）
+CHECK_LATEST_N = getattr(config, "CHECK_LATEST_N", 4)
+# 1回の実行で落とす最大本数（暴走防止）
+MAX_DOWNLOADS_PER_RUN = getattr(config, "MAX_DOWNLOADS_PER_RUN", 20)
+# 1本あたりのダウンロード完了待ちの上限（秒）。超えたら諦めて次へ
+PER_VIDEO_TIMEOUT = getattr(config, "PER_VIDEO_TIMEOUT", 3 * 60 * 60)
 
 HISTORY_FILE = "download_history.txt"
 
 if not os.path.exists(DOWNLOAD_DIR):
     os.makedirs(DOWNLOAD_DIR)
 
+
 # --- 履歴管理用関数 ---
 def get_downloaded_ids():
-    if not os.path.exists(HISTORY_FILE): return set()
+    if not os.path.exists(HISTORY_FILE):
+        return set()
     with open(HISTORY_FILE, "r") as f:
         return set(line.strip() for line in f)
+
 
 def save_downloaded_id(video_id):
     with open(HISTORY_FILE, "a") as f:
         f.write(f"{video_id}\n")
 
+
+def clean_partial_downloads():
+    """中断で残った .crdownload を掃除（ディスク詰まり・誤検知の防止）"""
+    for p in glob.glob(os.path.join(DOWNLOAD_DIR, "*.crdownload")):
+        try:
+            os.remove(p)
+            print(f"  古い部分ファイルを削除: {os.path.basename(p)}")
+        except Exception as e:
+            print(f"  部分ファイル削除失敗: {e}")
+
+
 # --- Chrome設定 ---
 chrome_options = Options()
-chrome_options.add_argument("--headless=new")  # ヘッドレスモード
+chrome_options.add_argument("--headless=new")
 chrome_options.add_argument("--no-sandbox")
 chrome_options.add_argument("--disable-dev-shm-usage")
-chrome_options.add_argument("--window-size=1920,1080")  # 画面サイズ固定
+chrome_options.add_argument("--window-size=1920,1080")
 
 prefs = {
     "download.default_directory": DOWNLOAD_DIR,
     "download.prompt_for_download": False,
     "directory_upgrade": True,
-    "safebrowsing.enabled": True
+    "safebrowsing.enabled": True,
 }
 chrome_options.add_experimental_option("prefs", prefs)
 
 driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
-
 driver.set_page_load_timeout(180)
-
-# ヘッドレスモードでのダウンロード許可設定
 driver.execute_cdp_cmd("Page.setDownloadBehavior", {
     "behavior": "allow",
-    "downloadPath": DOWNLOAD_DIR
+    "downloadPath": DOWNLOAD_DIR,
 })
-
 wait = WebDriverWait(driver, 120)
 
 
@@ -77,133 +94,146 @@ def dump_debug(tag):
         print(f"  HTML保存失敗: {e}")
 
 
+def open_dashboard():
+    driver.get(DASHBOARD_URL)
+    wait.until(EC.presence_of_element_located(
+        (By.CSS_SELECTOR, ".recordings-grid .recording-card")))
+
+
+def card_label(c):
+    return (c.get_attribute("innerText") or "").replace("\n", " ").strip()
+
+
+def download_one(video_id):
+    """ダッシュボード上で video_id の動画を開いてDL → NAS転送 → 履歴保存。成功でTrue"""
+    clean_partial_downloads()
+    open_dashboard()
+
+    # プレイヤーを開く（カードの onclick と同じ関数を直接呼ぶ）
+    driver.execute_script("loadModalPlayer(arguments[0]);", int(video_id))
+
+    # ダウンロードボタン（Video.js のモーダル起動ボタン）
+    download_menu_btn = wait.until(EC.presence_of_element_located(
+        (By.CSS_SELECTOR, "button.vjs-download-modal-button")))
+    driver.execute_script("arguments[0].click();", download_menu_btn)
+    time.sleep(1)
+
+    # 画質カード（例: 1080p / 720p ...）
+    quality_cards = wait.until(EC.presence_of_all_elements_located(
+        (By.CSS_SELECTOR, "button.dl-card")))
+
+    want = PREFERRED_QUALITY.rstrip("p")  # "720p" -> "720"
+    chosen = None
+    for c in quality_cards:
+        if want in card_label(c):
+            chosen = c
+            break
+    if chosen is None:
+        chosen = quality_cards[0]
+        print(f"  希望画質({PREFERRED_QUALITY})なし → 最高画質にフォールバック")
+    available = " / ".join(card_label(c).split(" ")[0] for c in quality_cards)
+    print(f"  画質: [{available}] → 選択 {card_label(chosen)}")
+
+    driver.execute_script("arguments[0].click();", chosen)
+    print("  ダウンロード開始...")
+
+    # ダウンロードが実際に開始したか確認
+    start_deadline = time.time() + 60
+    while time.time() < start_deadline:
+        files = os.listdir(DOWNLOAD_DIR)
+        if any(f.endswith(".crdownload") or f.endswith(".mp4") for f in files):
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError("ダウンロードが開始されませんでした")
+
+    # 完了待ち（上限つき）
+    deadline = time.time() + PER_VIDEO_TIMEOUT
+    while time.time() < deadline:
+        files = os.listdir(DOWNLOAD_DIR)
+        if not any(f.endswith(".crdownload") for f in files):
+            mp4_files = glob.glob(os.path.join(DOWNLOAD_DIR, "*.mp4"))
+            if mp4_files:
+                time.sleep(20)  # 書き込み完了の猶予
+                latest_file = max(mp4_files, key=os.path.getctime)
+                print(f"  ローカル完了: {os.path.basename(latest_file)}")
+
+                # NAS転送 → ローカル削除 → 履歴
+                if not os.path.ismount(NAS_MOUNT_DIR):
+                    raise RuntimeError(f"NAS未マウント({NAS_MOUNT_DIR})のため転送中止")
+                nas_path = os.path.join(NAS_MOUNT_DIR, os.path.basename(latest_file))
+                print(f"  NAS転送: {nas_path}")
+                shutil.copy2(latest_file, nas_path)
+                if not os.path.exists(nas_path):
+                    raise RuntimeError("NAS上にファイルが見当たりません")
+                os.remove(latest_file)
+                save_downloaded_id(video_id)
+                print("  完了（履歴記録）")
+                return True
+        time.sleep(15)
+
+    raise RuntimeError("ダウンロードが時間内に完了しませんでした")
+
+
 try:
-    # 1. ログイン処理
+    # 1. ログイン
     print("ログインページにアクセス中...")
     driver.get(LOGIN_URL)
     wait.until(EC.presence_of_element_located((By.NAME, "username"))).send_keys(USER_NAME)
     driver.find_element(By.NAME, "password").send_keys(PASSWORD)
-
     login_btn = driver.find_element(By.CSS_SELECTOR, "button[type='submit']")
     driver.execute_script("arguments[0].click();", login_btn)
     print("ログイン成功")
-
-    # 2. ダッシュボードへ移動
     time.sleep(5)
-    driver.get(DASHBOARD_URL)
-    print("ダッシュボード読み込み完了")
 
-    # 3. 最新動画のカード特定とID取得
-    first_card = wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, ".recordings-grid .recording-card:first-of-type")
-    ))
-    video_id = first_card.get_attribute("data-sr-mmclick-id")
+    # 2. ダッシュボードの表示中カードから対象IDを収集（新しい順）
+    open_dashboard()
+    time.sleep(1)
+    cards = driver.find_elements(By.CSS_SELECTOR, ".recordings-grid .recording-card")
+    all_ids = [c.get_attribute("data-sr-mmclick-id") for c in cards]
+    all_ids = [i for i in all_ids if i]
+    target_ids = all_ids[:CHECK_LATEST_N]
 
-    # 重複チェック
-    if video_id in get_downloaded_ids():
-        print(f"スキップ：ID {video_id} はすでに履歴に存在します。")
+    downloaded = get_downloaded_ids()
+    # 未取得のみ・古い順（数値昇順）で処理 → 取りこぼしを確実に消化
+    todo = sorted((i for i in target_ids if i not in downloaded), key=lambda x: int(x))
+
+    # テスト用: SR_ONLY=<id> で1本だけ処理（本番運用では未設定）
+    _only = os.environ.get("SR_ONLY")
+    if _only:
+        todo = [_only]
+        print(f"[TESTモード] SR_ONLY={_only} のみ処理します")
+
+    print(f"表示{len(all_ids)}件 / 確認対象{len(target_ids)}件(最新{CHECK_LATEST_N}) / 未取得{len(todo)}件")
+    if not todo:
+        print("新規動画はありません（すべて取得済み）。")
     else:
-        print(f"新規動画（ID: {video_id}）の処理を開始します。")
+        if len(todo) > MAX_DOWNLOADS_PER_RUN:
+            print(f"※ 上限{MAX_DOWNLOADS_PER_RUN}本まで。残りは次回実行で継続します。")
+            todo = todo[:MAX_DOWNLOADS_PER_RUN]
 
-        # 4. プレイヤー起動（JavaScriptで強制クリック）
-        thumb = first_card.find_element(By.CSS_SELECTOR, ".recording-thumbnail-wrapper")
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", thumb)
-        time.sleep(2)
-        driver.execute_script("arguments[0].click();", thumb)
-        print("プレイヤーを起動しました。")
-
-        # 5. ダウンロード実行
-        #    ※ streamrecorder.io のプレイヤーが Video.js 化され、DOM構造が変わっている：
-        #      旧: button.fa-download（雲アイコンが button 自身に付与）
-        #      新: button.vjs-download-modal-button（fa-download は中の <i> アイコン）
-        #      クリックでダウンロード用モーダルが開き、画質は button.dl-card で選ぶ
-        download_menu_btn = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "button.vjs-download-modal-button")
-        ))
-        driver.execute_script("arguments[0].click();", download_menu_btn)
-        time.sleep(1)
-
-        # モーダル内の画質カードを取得（例: 1080p / 720p ...）
-        quality_cards = wait.until(EC.presence_of_all_elements_located(
-            (By.CSS_SELECTOR, "button.dl-card")
-        ))
-
-        def card_label(c):
-            return (c.get_attribute("innerText") or "").replace("\n", " ").strip()
-
-        # 希望画質があれば優先、無ければ先頭（＝最高画質）にフォールバック
-        want = PREFERRED_QUALITY.rstrip("p")  # "720p" -> "720"
-        chosen = None
-        for c in quality_cards:
-            if want in card_label(c):
-                chosen = c
-                break
-        if chosen is None:
-            chosen = quality_cards[0]
-            print(f"希望画質({PREFERRED_QUALITY})が見つからないため、最高画質にフォールバックします。")
-
-        available = " / ".join(card_label(c).split(" ")[0] for c in quality_cards)
-        print(f"選択可能な画質: [{available}] → 選択: {card_label(chosen)}")
-
-        driver.execute_script("arguments[0].click();", chosen)
-        print("ダウンロードを開始しました...")
-
-        # ダウンロードが実際に開始したか確認（.crdownload / .mp4 の出現を待つ）
-        start_deadline = time.time() + 60
-        while time.time() < start_deadline:
-            files = os.listdir(DOWNLOAD_DIR)
-            if any(f.endswith(".crdownload") or f.endswith(".mp4") for f in files):
-                print("ダウンロード開始を確認しました。")
-                break
-            time.sleep(2)
-        else:
-            raise RuntimeError("ダウンロードが開始されませんでした（.crdownload が生成されません）")
-
-        # 6. ダウンロード完了検知
-        print("ファイルの保存完了を待機中（大容量のため時間がかかります）...")
-        while True:
-            # .crdownloadファイルがある間はループ
-            files = os.listdir(DOWNLOAD_DIR)
-            if not any(".crdownload" in f for f in files):
-                # mp4ファイルがフォルダにあるか最終確認
-                mp4_files = glob.glob(os.path.join(DOWNLOAD_DIR, '*.mp4'))
-                if mp4_files:
-                    time.sleep(20)  # 書き込み完了の猶予
-                    latest_file = max(mp4_files, key=os.path.getctime)
-                    print(f"ローカルでの処理完了：{os.path.basename(latest_file)}")
-
-                    # 7. NASへ転送 → ローカル削除 → 履歴保存
-                    if os.path.ismount(NAS_MOUNT_DIR):
-                        try:
-                            nas_path = os.path.join(NAS_MOUNT_DIR, os.path.basename(latest_file))
-                            print(f"NASへの転送を開始します: {nas_path}")
-
-                            # NASへコピー（shutil.copy2はメタデータも維持します）
-                            shutil.copy2(latest_file, nas_path)
-
-                            # 転送成功を確認してからローカルを削除
-                            if os.path.exists(nas_path):
-                                print("NASへの転送成功を確認。ローカルファイルを削除します。")
-                                os.remove(latest_file)
-                                # 全ての工程が成功してから履歴に保存
-                                save_downloaded_id(video_id)
-                                print("完了しました。")
-                            else:
-                                print("エラー：NAS上にファイルが見当たりません。")
-                        except Exception as e:
-                            print(f"NAS転送中にエラーが発生しました: {e}")
-                    else:
-                        print(f"エラー：NASが {NAS_MOUNT_DIR} にマウントされていません。転送を中止します。")
-                    break
-
-            time.sleep(15)
+        ok, ng = 0, 0
+        for idx, vid in enumerate(todo, start=1):
+            print(f"===== [{idx}/{len(todo)}] ID={vid} =====")
+            try:
+                download_one(vid)
+                ok += 1
+            except Exception as e:
+                ng += 1
+                print(f"  失敗: {type(e).__name__}: {e}")
+                try:
+                    dump_debug(f"vid{vid}")
+                except Exception:
+                    pass
+                clean_partial_downloads()
+                # 次の動画へ継続
+        print(f"===== 完了: 成功{ok}本 / 失敗{ng}本 =====")
 
 except Exception as e:
-    # 例外の種類が分からないと原因調査ができないので、型名・トレースバック・画面状態を残す
     print(f"エラーが発生しました: {type(e).__name__}: {e}")
     traceback.print_exc()
     try:
-        dump_debug("error")
+        dump_debug("fatal")
     except Exception:
         pass
 

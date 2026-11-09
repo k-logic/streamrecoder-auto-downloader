@@ -15,14 +15,12 @@ import config
 from config import LOGIN_URL, DASHBOARD_URL, USER_NAME, PASSWORD, DOWNLOAD_DIR
 
 # config.py に無ければデフォルトを使う（後方互換）
+# 録画ページ（2026-11 UI刷新: トークンで個別ページを開く）
+RECORDING_BASE = getattr(config, "RECORDING_BASE", "https://streamrecorder.io/userrecordings/recording/")
 NAS_MOUNT_DIR = getattr(config, "NAS_MOUNT_DIR", "/mnt/nas_video")
 PREFERRED_QUALITY = getattr(config, "PREFERRED_QUALITY", "720p")
-# ダッシュボード表示中カードのうち、新しい方から何件を対象にするか
-# （同日複数配信や取りこぼしを拾うため複数本を確認。ダッシュボードは最大16件表示）
 CHECK_LATEST_N = getattr(config, "CHECK_LATEST_N", 4)
-# 1回の実行で落とす最大本数（暴走防止）
 MAX_DOWNLOADS_PER_RUN = getattr(config, "MAX_DOWNLOADS_PER_RUN", 20)
-# 1本あたりのダウンロード完了待ちの上限（秒）。超えたら諦めて次へ
 PER_VIDEO_TIMEOUT = getattr(config, "PER_VIDEO_TIMEOUT", 3 * 60 * 60)
 
 HISTORY_FILE = "download_history.txt"
@@ -45,13 +43,14 @@ def save_downloaded_id(video_id):
 
 
 def clean_partial_downloads():
-    """中断で残った .crdownload を掃除（ディスク詰まり・誤検知の防止）"""
-    for p in glob.glob(os.path.join(DOWNLOAD_DIR, "*.crdownload")):
-        try:
-            os.remove(p)
-            print(f"  古い部分ファイルを削除: {os.path.basename(p)}")
-        except Exception as e:
-            print(f"  部分ファイル削除失敗: {e}")
+    """中断で残った .crdownload / 余計な html を掃除（ディスク詰まり・誤検知の防止）"""
+    for pat in ("*.crdownload", "*.html", "*.htm"):
+        for p in glob.glob(os.path.join(DOWNLOAD_DIR, pat)):
+            try:
+                os.remove(p)
+                print(f"  掃除: {os.path.basename(p)}")
+            except Exception as e:
+                print(f"  掃除失敗: {e}")
 
 
 # --- Chrome設定 ---
@@ -100,39 +99,37 @@ def open_dashboard():
         (By.CSS_SELECTOR, ".recordings-grid .recording-card")))
 
 
-def card_label(c):
-    return (c.get_attribute("innerText") or "").replace("\n", " ").strip()
-
-
-def download_one(video_id):
-    """ダッシュボード上で video_id の動画を開いてDL → NAS転送 → 履歴保存。成功でTrue"""
+def download_one(video_id, token):
+    """トークンの録画ページを開いてDL → NAS転送 → 履歴保存。成功でTrue"""
     clean_partial_downloads()
-    open_dashboard()
 
-    # プレイヤーを開く（カードの onclick と同じ関数を直接呼ぶ）
-    driver.execute_script("loadModalPlayer(arguments[0]);", int(video_id))
+    # 録画ページを直接開く（新UI: /userrecordings/recording/<token>）
+    driver.get(RECORDING_BASE + token)
 
-    # ダウンロードボタン（Video.js のモーダル起動ボタン）
-    download_menu_btn = wait.until(EC.presence_of_element_located(
-        (By.CSS_SELECTOR, "button.vjs-download-modal-button")))
-    driver.execute_script("arguments[0].click();", download_menu_btn)
+    # ダウンロードボタン（新プレイヤー srp2）
+    dl_btn = wait.until(EC.presence_of_element_located(
+        (By.CSS_SELECTOR, "button.srp2-dl-btn")))
+    driver.execute_script("arguments[0].click();", dl_btn)
     time.sleep(1)
 
-    # 画質カード（例: 1080p / 720p ...）
-    quality_cards = wait.until(EC.presence_of_all_elements_located(
-        (By.CSS_SELECTOR, "button.dl-card")))
+    # ダウンロード用の行（画質ごとの直リンク a.srp2-dlrow）
+    rows = wait.until(EC.presence_of_all_elements_located(
+        (By.CSS_SELECTOR, "a.srp2-dlrow")))
+
+    def row_label(r):
+        return (r.get_attribute("aria-label") or r.text or "").replace("\n", " ").strip()
 
     want = PREFERRED_QUALITY.rstrip("p")  # "720p" -> "720"
     chosen = None
-    for c in quality_cards:
-        if want in card_label(c):
-            chosen = c
+    for r in rows:
+        if want in row_label(r):
+            chosen = r
             break
     if chosen is None:
-        chosen = quality_cards[0]
-        print(f"  希望画質({PREFERRED_QUALITY})なし → 最高画質にフォールバック")
-    available = " / ".join(card_label(c).split(" ")[0] for c in quality_cards)
-    print(f"  画質: [{available}] → 選択 {card_label(chosen)}")
+        chosen = rows[0]
+        print(f"  希望画質({PREFERRED_QUALITY})なし → 先頭にフォールバック")
+    available = " / ".join(row_label(r) for r in rows)
+    print(f"  画質候補: [{available}] → 選択 {row_label(chosen)}")
 
     driver.execute_script("arguments[0].click();", chosen)
     print("  ダウンロード開始...")
@@ -186,25 +183,30 @@ try:
     print("ログイン成功")
     time.sleep(5)
 
-    # 2. ダッシュボードの表示中カードから対象IDを収集（新しい順）
+    # 2. ダッシュボードの表示中カードから (ID, token) を収集（新しい順）
     open_dashboard()
     time.sleep(1)
     cards = driver.find_elements(By.CSS_SELECTOR, ".recordings-grid .recording-card")
-    all_ids = [c.get_attribute("data-sr-mmclick-id") for c in cards]
-    all_ids = [i for i in all_ids if i]
-    target_ids = all_ids[:CHECK_LATEST_N]
+    pairs = []
+    for c in cards:
+        vid = c.get_attribute("data-sr-mmclick-id")
+        tok = c.get_attribute("data-sr-mmclick-token")
+        if vid and tok:
+            pairs.append((vid, tok))
+    target = pairs[:CHECK_LATEST_N]
 
     downloaded = get_downloaded_ids()
-    # 未取得のみ・古い順（数値昇順）で処理 → 取りこぼしを確実に消化
-    todo = sorted((i for i in target_ids if i not in downloaded), key=lambda x: int(x))
+    # 未取得のみ・古い順（数値昇順）
+    todo = sorted((p for p in target if p[0] not in downloaded), key=lambda p: int(p[0]))
 
     # テスト用: SR_ONLY=<id> で1本だけ処理（本番運用では未設定）
     _only = os.environ.get("SR_ONLY")
     if _only:
-        todo = [_only]
-        print(f"[TESTモード] SR_ONLY={_only} のみ処理します")
+        todo = [p for p in pairs if p[0] == _only] or todo
+        todo = todo[:1]
+        print(f"[TESTモード] SR_ONLY={_only}")
 
-    print(f"表示{len(all_ids)}件 / 確認対象{len(target_ids)}件(最新{CHECK_LATEST_N}) / 未取得{len(todo)}件")
+    print(f"表示{len(pairs)}件 / 確認対象{len(target)}件(最新{CHECK_LATEST_N}) / 未取得{len(todo)}件")
     if not todo:
         print("新規動画はありません（すべて取得済み）。")
     else:
@@ -213,10 +215,10 @@ try:
             todo = todo[:MAX_DOWNLOADS_PER_RUN]
 
         ok, ng = 0, 0
-        for idx, vid in enumerate(todo, start=1):
+        for idx, (vid, tok) in enumerate(todo, start=1):
             print(f"===== [{idx}/{len(todo)}] ID={vid} =====")
             try:
-                download_one(vid)
+                download_one(vid, tok)
                 ok += 1
             except Exception as e:
                 ng += 1
@@ -226,7 +228,6 @@ try:
                 except Exception:
                     pass
                 clean_partial_downloads()
-                # 次の動画へ継続
         print(f"===== 完了: 成功{ok}本 / 失敗{ng}本 =====")
 
 except Exception as e:

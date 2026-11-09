@@ -17,3 +17,6 @@ PREFERRED_QUALITY = "720p"
 CHECK_LATEST_N = 4
 # 1回の実行で落とす最大本数（暴走防止）
 MAX_DOWNLOADS_PER_RUN = 20
+
+# 録画ページのベースURL（2026-11 UI刷新でトークン個別ページ方式に）
+RECORDING_BASE = "https://streamrecorder.io/userrecordings/recording/"
